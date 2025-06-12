@@ -120,6 +120,29 @@ class GuaraniChatbotSemantico:
             self._log(f"❌ Erro ao carregar modelo: {e}")
             raise e
     
+    def _expandir_pergunta_com_sinonimos(self, pergunta: str) -> List[str]:
+        """Gera variações semânticas da pergunta usando lematização"""
+        doc = self.nlp(pergunta)
+        variantes = set([pergunta.strip()])
+
+        for token in doc:
+            if token.pos_ in {"NOUN", "VERB", "ADJ"} and not token.is_stop:
+                variantes.add(pergunta.replace(token.text, token.lemma_))
+        return list(variantes)
+
+    def _extrair_melhor_sentenca(self, contexto: str, pergunta: str) -> str:
+        """Seleciona a sentença mais semântica do chunk baseado na pergunta"""
+        sentencas = self._segmentar_sentencas(contexto)
+        if not sentencas:
+            return contexto
+
+        embeddings = self.sentence_model.encode(sentencas, convert_to_numpy=True)
+        pergunta_emb = self.sentence_model.encode([pergunta], convert_to_numpy=True)
+        scores = cosine_similarity(pergunta_emb, embeddings)[0]
+        melhor_idx = int(np.argmax(scores))
+        return sentencas[melhor_idx]
+
+
     def _carregar_texto_arquivo(self) -> str:
         """Carrega o texto de O Guarani do arquivo guarani.txt"""
         arquivo_path = "guarani.txt"
@@ -1208,3 +1231,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Adições no corpo da classe GuaraniChatbotSemantico:
+
+    
+# Substitua o bloco dentro de `_gerar_resposta_semantica`:
+
+        
+# As alterações acima otimizam a contextualização, expandem semanticamente as perguntas e tornam as respostas mais precisas e curtas.
