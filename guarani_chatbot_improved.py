@@ -49,8 +49,10 @@ class GuaraniChatbotImproved:
         self.top_chunks = 3        # Top chunks para resposta
         self.sentence_level = True # Nova feature: busca no nível de sentença
         
-        # Inicialização de componentes PLN
-        self._init_nlp_components()
+        # Inicializar estruturas de dados primeiro
+        self.conversation_history = []
+        self.processing_log = []
+        self.performance_metrics = []
         
         # Dados do sistema
         self.text_chunks = []
@@ -58,10 +60,8 @@ class GuaraniChatbotImproved:
         self.original_text = ""
         self.sentences_per_chunk = []  # Novo: mapeamento de sentenças por chunk
         
-        # Histórico expandido
-        self.conversation_history = []
-        self.processing_log = []
-        self.performance_metrics = []
+        # Inicialização de componentes PLN (após inicializar processing_log)
+        self._init_nlp_components()
         
         self._log("Sistema inicializado com sucesso")
     
@@ -75,9 +75,10 @@ class GuaraniChatbotImproved:
                 nltk.download('rslp', quiet=True)
                 self.stop_words = set(stopwords.words('portuguese'))
                 self.stemmer = RSLPStemmer()
+                self._log("NLTK inicializado com sucesso")
             else:
-                raise ImportError
-        except:
+                raise ImportError("NLTK não disponível")
+        except Exception as e:
             # Fallback: stop words básicas em português
             self.stop_words = {
                 'a', 'o', 'e', 'de', 'da', 'do', 'em', 'um', 'uma', 'com', 'para',
@@ -85,6 +86,7 @@ class GuaraniChatbotImproved:
                 'mas', 'ou', 'ter', 'ser', 'estar', 'seu', 'sua', 'seus', 'suas'
             }
             self.stemmer = None
+            self._log(f"Usando stop words básicas (NLTK indisponível: {e})")
         
         # Modelo de embeddings ou TF-IDF
         if EMBEDDINGS_AVAILABLE:
@@ -96,6 +98,7 @@ class GuaraniChatbotImproved:
                 self._log(f"Erro ao carregar SentenceTransformers: {e}")
                 self._init_tfidf_fallback()
         else:
+            self._log("SentenceTransformers não disponível, usando TF-IDF")
             self._init_tfidf_fallback()
     
     def _init_tfidf_fallback(self):
@@ -115,7 +118,14 @@ class GuaraniChatbotImproved:
         """Registra eventos no histórico de processamento"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = f"[{timestamp}] {message}"
-        self.processing_log.append(log_entry)
+        
+        # Verificação de segurança para evitar erros de inicialização
+        if hasattr(self, 'processing_log'):
+            self.processing_log.append(log_entry)
+        else:
+            # Fallback se processing_log ainda não foi inicializado
+            print(f"⚠️  Log antes da inicialização: {log_entry}")
+        
         print(f"📝 {log_entry}")
     
     def fase1_preparar_ambiente(self):
