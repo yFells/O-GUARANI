@@ -48,10 +48,10 @@ class GuaraniChatbotSemantico:
             raise ImportError("❌ Bibliotecas semânticas não disponíveis. Execute: pip install sentence-transformers scikit-learn")
         
         # Configurações otimizadas
-        self.chunk_size = 150
+        self.chunk_size = 300
         self.overlap = 0.3
         self.similarity_threshold = 0.3  # Ajustado para embeddings (valores mais altos)
-        self.top_chunks = 3
+        self.top_chunks = 5
         
         # Estruturas de dados
         self.conversation_history = []
@@ -563,62 +563,93 @@ Loredano é um dos antagonistas da história, um aventureiro italiano que se inf
         
         return base_msg + suggestion + examples + confidence
     
+    def _gerar_resposta_semantica_simples(self, chunks: List[Dict]) -> str:
+        """Gera resposta simples usando apenas o chunk mais relevante (fallback)."""
+        best_chunk = chunks[0]
+        main_content = best_chunk['chunk']
+        if len(main_content) > 700:
+            main_content = main_content[:700] + "..."
+        intro = "Com base na análise de 'O Guarani', o trecho mais relevante encontrado foi:\n\n"
+        confidence = self._calcular_confianca_semantica(best_chunk['similarity'])
+        return f"{intro}{main_content}\n\n{confidence}"
+
     def _gerar_resposta_semantica(self, pergunta: str, chunks: List[Dict]) -> str:
-        """Gera resposta usando análise semântica com re-ranking de sentenças."""
+        """Gera resposta usando análise semântica e re-ranking com NER do spaCy."""
         if not chunks:
             return self._resposta_nao_encontrada_semantica(pergunta, 0.0)
-        
+
         try:
-            self._log("🔬 Refinando resposta com re-ranking de sentenças...")
-            
-            # 1. Extrair todas as sentenças dos chunks relevantes
+            self._log("🔬 Refinando resposta com re-ranking de sentenças e análise de entidades (NER)...")
+
+            # 1. Extrair todas as sentenças candidatas dos chunks mais relevantes
             candidate_sentences = []
-            for chunk in chunks:
-                # A estrutura 'sentences' já existe em cada chunk_result
+            for chunk in chunks: # Usar os top_chunks já filtrados
                 if chunk.get('sentences'):
                     candidate_sentences.extend(chunk['sentences'])
-            
-            # Evitar sentenças duplicadas
-            candidate_sentences = list(dict.fromkeys(candidate_sentences))
-            
-            if not candidate_sentences:
-                # Fallback para o método antigo se não houver sentenças
-                return super()._gerar_resposta_semantica(pergunta, chunks)
+            candidate_sentences = list(dict.fromkeys(candidate_sentences)) # Remover duplicatas
 
-            # 2. Gerar embeddings para a pergunta e para as sentenças candidatas
+            if not candidate_sentences:
+                return "Não foi possível extrair sentenças para análise."
+
+            # 2. Analisar a pergunta com spaCy para encontrar entidades
+            pergunta_doc = self.nlp(pergunta)
+            pergunta_entidades = {ent.text.lower() for ent in pergunta_doc.ents}
+            if pergunta_entidades:
+                self._log(f"🔎 Entidades encontradas na pergunta: {list(pergunta_entidades)}")
+
+            # 3. Calcular similaridade semântica entre a pergunta e todas as sentenças
             question_embedding = self.sentence_model.encode([pergunta])
             sentences_embeddings = self.sentence_model.encode(candidate_sentences)
+            semantic_similarities = cosine_similarity(question_embedding, sentences_embeddings)[0]
 
-            # 3. Calcular a similaridade da pergunta com cada sentença
-            similarities = cosine_similarity(question_embedding, sentences_embeddings)[0]
+            # 4. Calcular score final combinando similaridade semântica e bônus de entidade
+            final_scores = []
+            entity_bonus = 0.25 # Hiperparâmetro: o peso do bônus de entidade
 
-            # 4. Encontrar a melhor sentença
-            best_sentence_index = np.argmax(similarities)
+            for i, sent in enumerate(candidate_sentences):
+                semantic_score = semantic_similarities[i]
+                bonus = 0.0
+
+                # Dar bônus se a sentença contiver as mesmas entidades da pergunta
+                if pergunta_entidades:
+                    sent_doc = self.nlp(sent)
+                    sent_entidades = {ent.text.lower() for ent in sent_doc.ents}
+                    if pergunta_entidades.intersection(sent_entidades):
+                        bonus = entity_bonus
+
+                final_scores.append(semantic_score + bonus)
+
+            # 5. Encontrar a melhor sentença com base no score final
+            best_sentence_index = np.argmax(final_scores)
             best_sentence = candidate_sentences[best_sentence_index]
-            best_sentence_similarity = float(similarities[best_sentence_index])
+            best_score = float(final_scores[best_sentence_index])
 
-            self._log(f"🏆 Melhor sentença encontrada (sim: {best_sentence_similarity:.3f}): {best_sentence}")
+            # A similaridade "real" é o score sem o bônus
+            best_semantic_similarity = float(semantic_similarities[best_sentence_index])
 
-            # 5. Decidir se a melhor sentença é boa o suficiente
-            # Usar um limiar um pouco mais alto para a resposta final
-            if best_sentence_similarity > 0.4:
-                intro = "De acordo com a análise, a informação mais precisa encontrada foi:\n\n"
+            self._log(f"🏆 Melhor sentença (score combinado: {best_score:.3f}): '{best_sentence}'")
+
+            # 6. Gerar a resposta final
+            # O limiar aqui deve ser sobre a similaridade semântica original para garantir relevância
+            if best_semantic_similarity > 0.35:
+                intro = "Analisando o texto, a informação mais precisa encontrada foi:\n\n"
                 main_content = best_sentence
-                confidence = self._calcular_confianca_semantica(best_sentence_similarity)
-                return intro + main_content + "\n\n" + confidence
+                # Usar o score combinado para o texto de confiança, pois ele reflete nossa confiança final
+                confidence = self._calcular_confianca_semantica(best_score)
+                return f"{intro} “{main_content}”\n\n{confidence}"
             else:
-                # Se a melhor sentença ainda não for boa o suficiente, usar o chunk original
-                self._log("⚠️ Melhor sentença não atingiu o limiar de confiança. Usando chunk principal.")
+                self._log(f"⚠️ Melhor sentença (sim: {best_semantic_similarity:.3f}) não atingiu o limiar. Usando chunk principal como fallback.")
                 main_content = chunks[0]['chunk']
                 if len(main_content) > 700:
                     main_content = main_content[:700] + "..."
-                intro = "Com base na análise semântica de 'O Guarani':\n\n"
+                intro = "Com base na análise de 'O Guarani', o trecho mais relevante encontrado foi:\n\n"
                 confidence = self._calcular_confianca_semantica(chunks[0]['similarity'])
-                return intro + main_content + "\n\n" + confidence
+                return f"{intro}{main_content}\n\n{confidence}"
 
         except Exception as e:
-            self._log(f"❌ Erro na geração de resposta semântica com re-ranking: {e}")
-            return f"❌ Erro ao gerar resposta: {e}"
+            self._log(f"❌ Erro na geração de resposta com NER: {e}")
+            # Em caso de erro, volte para a implementação mais simples
+            return self._gerar_resposta_semantica_simples(chunks)
     
     def _calcular_confianca_semantica(self, similarity: float) -> str:
         """Calcula indicador de confiança para similaridade semântica"""
