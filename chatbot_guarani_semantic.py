@@ -13,7 +13,15 @@ from typing import List, Dict, Optional
 import time
 import pickle
 from pathlib import Path
+import nltk
+import spacy
 
+# Importações para nltk tokenizacao
+try:
+    nltk.data.find('tokenizers/punkt')
+except nltk.downloader.DownloadError:
+    print("Baixando recurso 'punkt' do NLTK...")
+    nltk.download('punkt')
 # Importações para embeddings semânticos
 try:
     from sentence_transformers import SentenceTransformer
@@ -78,6 +86,16 @@ class GuaraniChatbotSemantico:
         
         # Inicializar modelo semântico
         self._inicializar_modelo_semantico()
+        
+        # ADICIONE ESTAS LINHAS
+        self._log("🧠 Carregando modelo linguístico spaCy...")
+        try:
+            self.nlp = spacy.load("pt_core_news_lg")
+            self._log("✅ Modelo spaCy carregado com sucesso.")
+        except IOError:
+            self._log("❌ ERRO: Modelo 'pt_core_news_lg' não encontrado.")
+            self._log("➡️ Execute: python -m spacy download pt_core_news_lg")
+            raise
         
         self._log("Sistema inicializado com sucesso")
     
@@ -228,15 +246,15 @@ Loredano é um dos antagonistas da história, um aventureiro italiano que se inf
         return True
     
     def _segmentar_sentencas(self, texto: str) -> List[str]:
-        """Segmentação robusta de sentenças"""
-        # Limpeza inicial
-        texto = re.sub(r'\n+', ' ', texto)
-        texto = re.sub(r'\s+', ' ', texto).strip()
-        
-        # Segmentação por pontuação
-        sentences = re.split(r'[.!?]+', texto)
+        """Segmentação robusta de sentenças usando NLTK."""
+        texto = re.sub(r'\s+', ' ', texto).strip() # Apenas normaliza espaços
+
+        # Usa o tokenizador treinado do NLTK, que é mais preciso
+        sentences = nltk.sent_tokenize(texto, language='portuguese')
+
+        # Filtra sentenças muito curtas ou vazias
         sentences = [s.strip() for s in sentences if s.strip() and len(s.split()) > 2]
-        
+
         return sentences
     
     def fase2_criar_chunks_e_embeddings(self):
@@ -546,48 +564,61 @@ Loredano é um dos antagonistas da história, um aventureiro italiano que se inf
         return base_msg + suggestion + examples + confidence
     
     def _gerar_resposta_semantica(self, pergunta: str, chunks: List[Dict]) -> str:
-        """Gera resposta usando análise semântica"""
+        """Gera resposta usando análise semântica com re-ranking de sentenças."""
         if not chunks:
             return self._resposta_nao_encontrada_semantica(pergunta, 0.0)
         
         try:
-            best_chunk = chunks[0]
+            self._log("🔬 Refinando resposta com re-ranking de sentenças...")
             
-            # Para embeddings semânticos, vamos usar o chunk completo mais relevante
-            # pois a similaridade já captura o significado geral
+            # 1. Extrair todas as sentenças dos chunks relevantes
+            candidate_sentences = []
+            for chunk in chunks:
+                # A estrutura 'sentences' já existe em cada chunk_result
+                if chunk.get('sentences'):
+                    candidate_sentences.extend(chunk['sentences'])
             
-            if len(chunks) == 1:
-                main_content = chunks[0]['chunk']
-                intro = "Com base na análise semântica de 'O Guarani':\n\n"
+            # Evitar sentenças duplicadas
+            candidate_sentences = list(dict.fromkeys(candidate_sentences))
+            
+            if not candidate_sentences:
+                # Fallback para o método antigo se não houver sentenças
+                return super()._gerar_resposta_semantica(pergunta, chunks)
+
+            # 2. Gerar embeddings para a pergunta e para as sentenças candidatas
+            question_embedding = self.sentence_model.encode([pergunta])
+            sentences_embeddings = self.sentence_model.encode(candidate_sentences)
+
+            # 3. Calcular a similaridade da pergunta com cada sentença
+            similarities = cosine_similarity(question_embedding, sentences_embeddings)[0]
+
+            # 4. Encontrar a melhor sentença
+            best_sentence_index = np.argmax(similarities)
+            best_sentence = candidate_sentences[best_sentence_index]
+            best_sentence_similarity = float(similarities[best_sentence_index])
+
+            self._log(f"🏆 Melhor sentença encontrada (sim: {best_sentence_similarity:.3f}): {best_sentence}")
+
+            # 5. Decidir se a melhor sentença é boa o suficiente
+            # Usar um limiar um pouco mais alto para a resposta final
+            if best_sentence_similarity > 0.4:
+                intro = "De acordo com a análise, a informação mais precisa encontrada foi:\n\n"
+                main_content = best_sentence
+                confidence = self._calcular_confianca_semantica(best_sentence_similarity)
+                return intro + main_content + "\n\n" + confidence
             else:
-                # Combinar os chunks mais relevantes semanticamente
-                combined_chunks = []
-                total_length = 0
-                similarity_scores = []
-                
-                for chunk in chunks[:3]:  # Máximo 3 chunks semanticamente relevantes
-                    chunk_text = chunk['chunk']
-                    if total_length + len(chunk_text) < 800:  # Limite um pouco maior para semântica
-                        combined_chunks.append(chunk_text)
-                        similarity_scores.append(chunk['similarity'])
-                        total_length += len(chunk_text)
-                    else:
-                        break
-                
-                main_content = "\n\n".join(combined_chunks)
-                avg_similarity = sum(similarity_scores) / len(similarity_scores) if similarity_scores else 0
-                intro = f"Combinando informações semanticamente relevantes de 'O Guarani' (similaridade média: {avg_similarity:.3f}):\n\n"
-            
-            # Truncar se muito longo, mas manter mais contexto para análise semântica
-            if len(main_content) > 700:
-                main_content = main_content[:700] + "..."
-            
-            confidence = self._calcular_confianca_semantica(best_chunk['similarity'])
-            return intro + main_content + "\n\n" + confidence
-            
+                # Se a melhor sentença ainda não for boa o suficiente, usar o chunk original
+                self._log("⚠️ Melhor sentença não atingiu o limiar de confiança. Usando chunk principal.")
+                main_content = chunks[0]['chunk']
+                if len(main_content) > 700:
+                    main_content = main_content[:700] + "..."
+                intro = "Com base na análise semântica de 'O Guarani':\n\n"
+                confidence = self._calcular_confianca_semantica(chunks[0]['similarity'])
+                return intro + main_content + "\n\n" + confidence
+
         except Exception as e:
-            self._log(f"Erro na geração de resposta semântica: {e}")
-            return f"❌ Erro ao gerar resposta semântica: {e}"
+            self._log(f"❌ Erro na geração de resposta semântica com re-ranking: {e}")
+            return f"❌ Erro ao gerar resposta: {e}"
     
     def _calcular_confianca_semantica(self, similarity: float) -> str:
         """Calcula indicador de confiança para similaridade semântica"""
