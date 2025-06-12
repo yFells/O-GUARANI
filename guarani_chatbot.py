@@ -51,16 +51,19 @@ class GuaraniChatbot:
         # Configurações
         self.chunk_size = 250  # palavras por chunk
         self.overlap = 0.5     # 50% de sobreposição
-        self.similarity_threshold = 0.3  # limiar mínimo de similaridade
+        self.similarity_threshold = 0.05  # limiar mínimo de similaridade (reduzido)
         self.top_chunks = 3    # top chunks para resposta
         
         # Componentes do sistema
         self.stemmer = RSLPStemmer()
         self.stop_words = set(stopwords.words('portuguese'))
         self.vectorizer = TfidfVectorizer(
-            max_features=5000,
-            stop_words=list(self.stop_words),
-            ngram_range=(1, 2)
+            max_features=3000,  # Aumentado
+            stop_words=None,    # Removido stopwords para capturar mais contexto
+            ngram_range=(1, 2),
+            min_df=1,           # Frequência mínima
+            max_df=0.95,        # Frequência máxima
+            lowercase=True
         )
         
         # Dados do sistema
@@ -85,8 +88,62 @@ class GuaraniChatbot:
         """Fase 1: Preparação do ambiente e obtenção dos dados"""
         self._log("=== FASE 1: PREPARAÇÃO DO AMBIENTE ===")
         
-        # Simulando obtenção do texto (normalmente seria um arquivo)
-        sample_text = """
+        # Carregamento do texto completo do arquivo guarani.txt
+        texto_carregado = self._carregar_texto_guarani()
+        
+        if texto_carregado:
+            self.original_text = texto_carregado
+            self._log(f"Texto carregado do arquivo: {len(texto_carregado)} caracteres")
+            
+            # Estatísticas do texto
+            num_palavras = len(texto_carregado.split())
+            num_linhas = len(texto_carregado.splitlines())
+            self._log(f"Estatísticas: {num_palavras} palavras, {num_linhas} linhas")
+            
+            return True
+        else:
+            self._log("Erro: Não foi possível carregar o texto")
+            return False
+    
+    def _carregar_texto_guarani(self):
+        """Carrega o texto completo de O Guarani do arquivo guarani.txt"""
+        try:
+            # Lista de encodings para tentar
+            encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'utf-8-sig']
+            
+            for encoding in encodings:
+                try:
+                    with open('guarani.txt', 'r', encoding=encoding) as arquivo:
+                        texto = arquivo.read()
+                        self._log(f"Arquivo carregado com encoding: {encoding}")
+                        
+                        # Validação básica do conteúdo
+                        if len(texto) < 1000:
+                            self._log("Aviso: Arquivo muito pequeno, pode estar incompleto")
+                        
+                        return texto
+                        
+                except UnicodeDecodeError:
+                    self._log(f"Falha no encoding {encoding}, tentando próximo...")
+                    continue
+                except FileNotFoundError:
+                    self._log("ERRO: Arquivo 'guarani.txt' não encontrado na raiz do projeto!")
+                    self._log("Por favor, certifique-se de que o arquivo existe no diretório correto.")
+                    break
+            
+            # Se chegou aqui, não conseguiu carregar
+            self._log("ERRO: Não foi possível carregar o arquivo com nenhum encoding.")
+            self._log("Usando texto de demonstração como fallback...")
+            
+            return self._texto_fallback()
+            
+        except Exception as e:
+            self._log(f"ERRO inesperado ao carregar arquivo: {e}")
+            return self._texto_fallback()
+    
+    def _texto_fallback(self):
+        """Texto de demonstração caso o arquivo não seja encontrado"""
+        return """
         O Guarani é um romance de José de Alencar publicado em 1857. A história se passa no século XVII, 
         durante a colonização do Brasil. O protagonista é Peri, um índio goitacá de força excepcional 
         e lealdade inquebrantável.
@@ -97,6 +154,8 @@ class GuaraniChatbot:
         Dom Antônio de Mariz é um nobre português que se estabeleceu no Brasil com sua família. 
         Ele possui um castelo fortificado às margens do rio Paquequer, onde vive com sua esposa, 
         filhos e alguns agregados.
+        
+        [AVISO: Este é um texto de demonstração. Para funcionalidade completa, adicione o arquivo 'guarani.txt' na raiz do projeto]
         
         A obra retrata os conflitos entre diferentes grupos: os portugueses colonizadores, 
         os índios aimorés (inimigos de Peri) e os aventureiros que buscam ouro na região.
@@ -119,10 +178,6 @@ class GuaraniChatbot:
         A linguagem de Alencar mescla o português culto com expressões que buscam 
         retratar a fala dos personagens indígenas, criando um estilo único.
         """
-        
-        self.original_text = sample_text
-        self._log(f"Texto carregado: {len(sample_text)} caracteres")
-        return True
     
     def fase2_processar_dados(self):
         """Fase 2: Processamento e estruturação dos dados"""
@@ -170,7 +225,12 @@ class GuaraniChatbot:
         # Busca por similaridade
         similarities = cosine_similarity(question_vector, self.chunk_vectors).flatten()
         
-        # Ranqueamento e filtragem
+        # Debug: mostrar estatísticas de similaridade
+        max_sim = np.max(similarities) if len(similarities) > 0 else 0
+        mean_sim = np.mean(similarities) if len(similarities) > 0 else 0
+        self._log(f"Similaridade máxima: {max_sim:.3f}, média: {mean_sim:.3f}")
+        
+        # Ranqueamento e filtragem com limiar adaptativo
         relevant_chunks = []
         for i, similarity in enumerate(similarities):
             if similarity >= self.similarity_threshold:
@@ -180,15 +240,32 @@ class GuaraniChatbot:
                     'similarity': similarity
                 })
         
+        # Se não encontrou nada, reduzir o limiar temporariamente
+        if not relevant_chunks and max_sim > 0:
+            lower_threshold = max(0.01, max_sim * 0.5)  # 50% da maior similaridade
+            self._log(f"Reduzindo limiar para {lower_threshold:.3f}")
+            
+            for i, similarity in enumerate(similarities):
+                if similarity >= lower_threshold:
+                    relevant_chunks.append({
+                        'chunk_id': i,
+                        'text': self.text_chunks[i],
+                        'similarity': similarity
+                    })
+        
         # Ordenação por similaridade
         relevant_chunks.sort(key=lambda x: x['similarity'], reverse=True)
         top_chunks = relevant_chunks[:self.top_chunks]
         
         self._log(f"Encontrados {len(relevant_chunks)} chunks relevantes")
         
+        # Debug: mostrar os melhores chunks encontrados
+        for i, chunk in enumerate(top_chunks[:2]):
+            self._log(f"Chunk {i+1}: similaridade {chunk['similarity']:.3f}")
+        
         # Geração da resposta
         if not top_chunks:
-            response = "Desculpe, não encontrei informações relevantes sobre sua pergunta."
+            response = "Desculpe, não encontrei informações relevantes sobre sua pergunta no texto de 'O Guarani'. Tente reformular a pergunta ou ser mais específico."
         else:
             response = self._generate_response(pergunta, top_chunks)
         
@@ -241,20 +318,23 @@ class GuaraniChatbot:
         return text.strip()
     
     def _preprocess_text(self, text: str) -> str:
-        """Pré-processa texto: tokenização, remoção de stopwords, stemming"""
-        # Tokenização
-        tokens = word_tokenize(text.lower(), language='portuguese')
+        """Pré-processa texto: limpeza básica mantendo mais contexto"""
+        # Converter para minúsculas
+        text = text.lower()
         
-        # Remoção de stopwords e tokens muito pequenos
-        filtered_tokens = [
-            token for token in tokens 
-            if token not in self.stop_words and len(token) > 2 and token.isalpha()
-        ]
+        # Remover caracteres especiais mas manter acentos
+        text = re.sub(r'[^\w\sáéíóúâêîôûãõç.,!?;:]', ' ', text)
         
-        # Stemming
-        stemmed_tokens = [self.stemmer.stem(token) for token in filtered_tokens]
+        # Normalizar espaços
+        text = re.sub(r'\s+', ' ', text)
         
-        return ' '.join(stemmed_tokens)
+        # Tokenização simples mantendo palavras importantes
+        tokens = text.split()
+        
+        # Filtrar apenas tokens muito pequenos (menos de 2 caracteres)
+        filtered_tokens = [token for token in tokens if len(token) > 1]
+        
+        return ' '.join(filtered_tokens)
     
     def _create_chunks(self, text: str) -> List[str]:
         """Cria chunks de texto com sobreposição"""
@@ -288,23 +368,31 @@ class GuaraniChatbot:
     
     def _generate_response(self, pergunta: str, chunks: List[Dict]) -> str:
         """Gera resposta baseada nos chunks mais relevantes"""
-        # Template de resposta
-        intro = "Com base na obra 'O Guarani':\n\n"
+        # Combinar informações dos melhores chunks
+        if len(chunks) == 1:
+            # Uma única fonte
+            main_content = chunks[0]['text']
+            intro = "Com base no texto de 'O Guarani':\n\n"
+        else:
+            # Múltiplas fontes - combinar informações
+            textos = [chunk['text'] for chunk in chunks[:2]]  # Usar top 2
+            main_content = " ".join(textos)
+            intro = "Combinando informações de 'O Guarani':\n\n"
         
-        # Extrai informações dos chunks mais relevantes
-        main_content = chunks[0]['text']
+        # Truncar se muito longo
+        if len(main_content) > 500:
+            main_content = main_content[:500] + "..."
         
-        # Formatação simples da resposta
         response = intro + main_content
         
-        # Adiciona informação de confiança
+        # Adicionar informação de confiança
         confidence = chunks[0]['similarity']
-        if confidence > 0.7:
+        if confidence > 0.4:
             confidence_text = " (Alta confiança)"
-        elif confidence > 0.5:
+        elif confidence > 0.2:
             confidence_text = " (Confiança moderada)"
         else:
-            confidence_text = " (Baixa confiança)"
+            confidence_text = " (Baixa confiança - considere reformular a pergunta)"
         
         return response + confidence_text
     
